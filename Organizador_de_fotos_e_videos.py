@@ -15,12 +15,27 @@ from collections import defaultdict
 # ============================================================
 
 ORIGEM = Path(
-    r"D:\COISAS ALEATORIAS\Fotos e Videos"
+    r"D:\Takeout"
 )
 
 DESTINO = Path(
     r"D:\FOTOS e VIDEOS"
 )
+
+MESES = {
+    1: "01 - JANEIRO",
+    2: "02 - FEVEREIRO",
+    3: "03 - MARÇO",
+    4: "04 - ABRIL",
+    5: "05 - MAIO",
+    6: "06 - JUNHO",
+    7: "07 - JULHO",
+    8: "08 - AGOSTO",
+    9: "09 - SETEMBRO",
+    10: "10 - OUTUBRO",
+    11: "11 - NOVEMBRO",
+    12: "12 - DEZEMBRO",
+}
 
 
 # ============================================================
@@ -162,9 +177,19 @@ class Progresso:
 
         self.mostrar()
 
+    def concluir(self):
+        """Exibe explicitamente 100% mesmo quando a etapa não tem bytes."""
+
+        self.atual = self.total
+        self.bytes_atual = self.total_bytes
+        self.mostrar()
+
     def mostrar(self):
 
-        if self.total_bytes > 0:
+        if self.total == 0 and self.total_bytes == 0:
+            percentual = 100
+
+        elif self.total_bytes > 0:
 
             percentual = (
                 self.bytes_atual /
@@ -273,6 +298,10 @@ def ler_todos_json():
     lidos = 0
     validos = 0
     com_data = 0
+    progresso = Progresso(
+        len(arquivos_json),
+        0
+    )
 
     for json_path in arquivos_json:
 
@@ -291,7 +320,7 @@ def ler_todos_json():
             lidos += 1
 
         except Exception:
-
+            progresso.atualizar()
             continue
 
         if not isinstance(
@@ -299,6 +328,7 @@ def ler_todos_json():
             dict
         ):
 
+            progresso.atualizar()
             continue
 
         validos += 1
@@ -343,6 +373,7 @@ def ler_todos_json():
 
         if not timestamp:
 
+            progresso.atualizar()
             continue
 
         try:
@@ -353,6 +384,7 @@ def ler_todos_json():
 
         except Exception:
 
+            progresso.atualizar()
             continue
 
         com_data += 1
@@ -375,6 +407,10 @@ def ler_todos_json():
                 data,
                 json_path
             )
+
+        progresso.atualizar()
+
+    progresso.concluir()
 
     print(
         f"   JSON lidos      : {lidos:,}"
@@ -925,25 +961,10 @@ def encontrar_midias(
 
 def destino_correto(data):
 
-    meses = {
-        1: "JANEIRO",
-        2: "FEVEREIRO",
-        3: "MARÇO",
-        4: "ABRIL",
-        5: "MAIO",
-        6: "JUNHO",
-        7: "JULHO",
-        8: "AGOSTO",
-        9: "SETEMBRO",
-        10: "OUTUBRO",
-        11: "NOVEMBRO",
-        12: "DEZEMBRO",
-    }
-
     return (
         DESTINO /
         str(data.year) /
-        meses[data.month]
+        MESES[data.month]
     )
 
 # ============================================================
@@ -1123,6 +1144,7 @@ def analisar_e_corrigir_destino(
 
     if not arquivos:
 
+        Progresso(0, 0).concluir()
         print(
             "✓ Nenhum arquivo antigo para corrigir."
         )
@@ -1272,6 +1294,7 @@ def verificar_estrutura_final(indice):
     arquivos, total_bytes = encontrar_midias(DESTINO)
 
     if not arquivos:
+        Progresso(0, 0).concluir()
         print("📂 Nenhuma mídia encontrada no destino.")
         return True
 
@@ -1320,6 +1343,16 @@ def verificar_estrutura_final(indice):
             flush=True
         )
 
+    if total:
+        print(
+            "\r"
+            f"🔍 [{'█' * 40}] 100.00% "
+            f"| {total:,}/{total:,} "
+            "| ⏳ 00:00:00",
+            end="",
+            flush=True
+        )
+
     print()
     print()
 
@@ -1363,6 +1396,11 @@ def remover_pastas_vazias():
         reverse=True
     )
 
+    progresso = Progresso(
+        len(todas),
+        0
+    )
+
     for pasta in todas:
 
         try:
@@ -1375,6 +1413,9 @@ def remover_pastas_vazias():
         except Exception:
             pass
 
+        progresso.atualizar()
+
+    progresso.concluir()
     return removidas
 
 # ============================================================
@@ -1440,6 +1481,7 @@ def remover_duplicados():
 
     if not candidatos:
 
+        Progresso(0, 0).concluir()
         print(
             "✓ Nenhum duplicado encontrado."
         )
@@ -1513,6 +1555,15 @@ def remover_duplicados():
             flush=True
         )
 
+    print(
+        "\r"
+        f"🧬 Hash: {'█' * 40} 100.00% "
+        f"| {len(candidatos):,}/{len(candidatos):,} "
+        "| ⏳ 00:00:00",
+        end="",
+        flush=True
+    )
+
     print()
     print()
 
@@ -1522,6 +1573,10 @@ def remover_duplicados():
     )
 
     recopiados = 0
+    progresso_remocao = Progresso(
+        len(duplicados),
+        0
+    )
 
     for duplicado, original in duplicados:
 
@@ -1533,6 +1588,9 @@ def remover_duplicados():
 
         except Exception:
             pass
+        progresso_remocao.atualizar()
+
+    progresso_remocao.concluir()
 
     print(
         f"🗑️ Duplicados removidos: "
@@ -1704,6 +1762,7 @@ def main():
 
     if not arquivos:
 
+        Progresso(0, 0).concluir()
         print(
             "✓ Nenhuma mídia restante na origem."
         )
@@ -1731,7 +1790,11 @@ def main():
         )
 
         print(
-            "   📂 Organizar como ANO\\MÊS"
+        "   📂 Organizar como ANO\\MM - MÊS "
+        "(01 - JANEIRO, 02 - FEVEREIRO, ...)"
+        )
+
+        print(
         "   🏷️ Renomear como DD_MM_AAAA.ext"
         )
 
@@ -1750,7 +1813,7 @@ def main():
         )
 
         print(
-            r"C:\Users\hhhel\OneDrive\Documentos\2018\NOVEMBRO"
+            r"D:\FOTOS e VIDEOS\2018\11 - NOVEMBRO"
         )
 
         print()
@@ -2000,7 +2063,7 @@ def main():
     )
 
     print(
-        r"C:\Users\hhhel\OneDrive\Documentos\ANO\MÊS"
+        r"D:\FOTOS e VIDEOS\AAAA\MM - MÊS"
     )
 
     print()
@@ -2010,7 +2073,7 @@ def main():
     )
 
     print(
-        r"C:\Users\hhhel\OneDrive\Documentos\2018\NOVEMBRO"
+        r"D:\FOTOS e VIDEOS\2018\11 - NOVEMBRO"
     )
 
     print()
@@ -2028,7 +2091,7 @@ def main():
     )
 
     print(
-        "✓ Estrutura final ANO\\MÊS verificada"
+        "✓ Estrutura final ANO\\MM - MÊS verificada"
     )
 
     print(
