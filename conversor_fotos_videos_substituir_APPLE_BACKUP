@@ -1,0 +1,479 @@
+"""Conversor de fotos e vídeos para PNG e MP4 - substituição na própria pasta.
+
+REGRAS:
+- Caminho padrão: D:\\FOTOS e VIDEOS
+- Lista de formatos ignorados (NÃO converte):
+  .pjp, .jfif, .jpe, .jpeg, .jpg, .pjpeg, .png, .heif, .mov, .m4v, .mp4, .webp
+- Outras Fotos: convertidas para .png.
+- Outros Vídeos: convertidos para .mp4.
+- Mostra o progresso no formato [X/TOTAL].
+- Exibe o status em tempo real na tela (sem arquivo de log).
+"""
+
+from __future__ import annotations
+
+import os
+import queue
+import re
+import shutil
+import subprocess
+import tempfile
+import threading
+import tkinter as tk
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+from typing import Callable, Optional
+
+try:
+    from PIL import Image, ImageOps, UnidentifiedImageError
+    try:
+        import pillow_heif
+        pillow_heif.register_heif_opener()
+    except ImportError:
+        pass
+except ImportError:
+    Image = None
+    ImageOps = None
+    UnidentifiedImageError = OSError
+
+
+# Extensões que serão TOTALMENTE IGNORADAS (pula a conversão)
+IGNORED_EXTENSIONS = {
+    ".pjp", ".jfif", ".jpe", ".jpeg", ".jpg", ".pjpeg",
+    ".png", ".heif", ".mov", ".m4v", ".mp4", ".webp",
+}
+
+# Outros formatos de imagem para converter em PNG
+PHOTO_EXTENSIONS = {
+    ".avif", ".gif", ".bmp", ".tif", ".tiff", ".heic", ".heics", ".heifs",
+    ".jp2", ".j2k", ".jpf", ".jpx", ".raw", ".dng", ".cr2", ".cr3",
+    ".nef", ".nrw", ".arw", ".srf", ".sr2", ".orf", ".rw2", ".raf",
+    ".pef", ".rwl", ".3fr", ".iiq", ".kdc", ".dcr", ".erf", ".x3f",
+}
+
+# Outros formatos de vídeo para converter em MP4
+VIDEO_EXTENSIONS = {
+    ".qt", ".avi", ".mkv", ".mk3d", ".webm", ".wmv", ".asf",
+    ".flv", ".f4v", ".mpeg", ".mpg", ".mpe", ".mpv", ".3gp",
+    ".3g2", ".ts", ".mts", ".m2ts", ".m2t", ".vob", ".ogv",
+    ".ogg", ".rm", ".rmvb", ".divx",
+}
+
+DEFAULT_INPUT = r"D:\FOTOS e VIDEOS"
+
+
+@dataclass(frozen=True)
+class ProgressEvent:
+    current: int
+    total: int
+    message: str
+
+
+@dataclass(frozen=True)
+class FinishedEvent:
+    converted: int
+    skipped: int
+    errors: list[str]
+
+
+def find_ffmpeg() -> Optional[str]:
+    """Encontra o FFmpeg no PATH, no imageio-ffmpeg ou em instalações comuns."""
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+
+    try:
+        import imageio_ffmpeg
+    except ImportError:
+        pass
+    else:
+        imageio_ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if Path(imageio_ffmpeg_exe).is_file():
+            return imageio_ffmpeg_exe
+
+    candidates = (
+        Path(os.environ.get("LOCALAPPDATA", ""))
+        / "Microsoft" / "WinGet"
+        / "Packages"
+        / "Gyan.FFmpeg.Shared_Msix64__8wekyb3d8bbwe"
+        / "ffmpeg.exe",
+        Path(r"C:\ffmpeg\bin\ffmpeg.exe"),
+        Path(r"C:\Program Files\ffmpeg\bin\ffmpeg.exe"),
+    )
+
+    return next((str(path) for path in candidates if path.is_file()), None)
+
+
+def scan_files(input_dir: Path, report: Callable[[int, int, str], None]) -> tuple[list[tuple[Path, str]], int]:
+    """Mapeia a pasta e subpastas ignorando as extensões configuradas."""
+    report(0, 0, "🔍 Mapeando pasta e subpastas...")
+    
+    files_to_process: list[tuple[Path, str]] = []
+    ignored_count = 0
+
+    for path in input_dir.rglob("*"):
+        if not path.is_file():
+            continue
+
+        suffix = path.suffix.lower()
+
+        if suffix in IGNORED_EXTENSIONS:
+            ignored_count += 1
+        elif suffix in PHOTO_EXTENSIONS:
+            files_to_process.append((path, "foto"))
+        elif suffix in VIDEO_EXTENSIONS:
+            files_to_process.append((path, "video"))
+
+    report(
+        0, 
+        len(files_to_process), 
+        f"📊 Mapeamento: {len(files_to_process)} para converter ({ignored_count} ignorados por formato)."
+    )
+    return files_to_process, ignored_count
+
+
+def preserve_file_times(source: Path, destination: Path) -> None:
+    source_stat = source.stat()
+    os.utime(destination, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
+
+
+def make_temp_path(destination: Path) -> Path:
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{destination.stem}_convertendo_",
+        suffix=destination.suffix,
+        dir=str(destination.parent),
+    )
+    os.close(fd)
+    temp_path = Path(temp_name)
+    try:
+        temp_path.unlink()
+    except OSError:
+        pass
+    return temp_path
+
+
+def replace_original(source: Path, temp_path: Path, destination: Path) -> None:
+    if source.resolve() == destination.resolve():
+        temp_path.replace(source)
+    else:
+        temp_path.replace(destination)
+        try:
+            source.unlink()
+        except OSError:
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+
+
+def convert_photo(source: Path, destination: Path) -> None:
+    if Image is None or ImageOps is None:
+        raise RuntimeError("Biblioteca Pillow não instalada. Execute: pip install pillow")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = make_temp_path(destination)
+
+    try:
+        with Image.open(source) as original:
+            exif = original.getexif()
+            image_metadata = {}
+
+            for key in ("icc_profile", "dpi", "xmp"):
+                if key in original.info:
+                    image_metadata[key] = original.info[key]
+
+            image = ImageOps.exif_transpose(original)
+
+            if exif:
+                exif[274] = 1
+                image_metadata["exif"] = exif
+
+            if image.mode not in ("RGB", "RGBA"):
+                image = image.convert("RGBA" if "transparency" in image.info else "RGB")
+
+            image.save(temp_path, "PNG", **image_metadata)
+
+        preserve_file_times(source, temp_path)
+        replace_original(source, temp_path, destination)
+
+    except Exception:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def convert_video(source: Path, destination: Path, ffmpeg: str) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = make_temp_path(destination)
+
+    command = [
+        ffmpeg, "-y",
+        "-i", str(source),
+        "-map", "0:v:0?",
+        "-map", "0:a:0?",
+        "-map_metadata", "0",
+        "-map_chapters", "0",
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "20",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-movflags", "+faststart",
+        str(temp_path),
+    ]
+
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            creationflags=creationflags
+        )
+
+        if result.returncode != 0:
+            error_lines = result.stderr.strip().splitlines()
+            message = error_lines[-1] if error_lines else "FFmpeg falhou ao converter o vídeo."
+            raise RuntimeError(message)
+
+        preserve_file_times(source, temp_path)
+        replace_original(source, temp_path, destination)
+
+    except Exception:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def convert_all(
+    input_dir: Path,
+    report: Callable[[int, int, str], None],
+    stop_event: threading.Event,
+) -> tuple[int, int, list[str]]:
+
+    files, skipped_already = scan_files(input_dir, report)
+    
+    total = len(files)
+    converted = 0
+    errors: list[str] = []
+
+    if total == 0:
+        report(0, 0, f"ℹ️ Nenhum arquivo para converter ({skipped_already} arquivos foram ignorados por formato).")
+        return 0, skipped_already, []
+
+    ffmpeg = find_ffmpeg()
+
+    report(0, total, f"⏳ Iniciando conversão... [0/{total}]")
+
+    for index, (source, kind) in enumerate(files, start=1):
+        if stop_event.is_set():
+            report(index - 1, total, f"⏹️ Interrompido pelo usuário no arquivo [{index - 1}/{total}].")
+            break
+
+        destination = source.with_suffix(".png" if kind == "foto" else ".mp4")
+        action_type = "Foto → PNG" if kind == "foto" else "Vídeo → MP4"
+
+        report(
+            index - 1,
+            total,
+            f"⏳ [{index - 1}/{total}] Convertendo ({action_type}): {source.name}"
+        )
+
+        try:
+            if kind == "foto":
+                if Image is None:
+                    raise RuntimeError("Pillow não encontrado.")
+                convert_photo(source, destination)
+            else:
+                if ffmpeg is None:
+                    raise RuntimeError("FFmpeg não encontrado.")
+                convert_video(source, destination, ffmpeg)
+
+            converted += 1
+            report(
+                index,
+                total,
+                f"✅ [{index}/{total}] Concluído: {source.name} → {destination.name}"
+            )
+
+        except (OSError, RuntimeError, ValueError) as error:
+            err_msg = f"{source.name}: {error}"
+            errors.append(err_msg)
+            report(index, total, f"❌ [{index}/{total}] Erro em: {source.name}")
+
+    return converted, skipped_already, errors
+
+
+class ConverterApp:
+    def __init__(self) -> None:
+        self.root = tk.Tk()
+        self.root.title("🖼️🎬 Conversor PNG + MP4")
+        self.root.geometry("760x540")
+        self.root.minsize(680, 470)
+
+        self.events: queue.Queue[ProgressEvent | FinishedEvent] = queue.Queue()
+        self.stop_event = threading.Event()
+        self.running = False
+
+        self.input_var = tk.StringVar(value=DEFAULT_INPUT)
+        self.progress_var = tk.DoubleVar(value=0)
+        self.status_var = tk.StringVar(value="👋 Clique em COMEÇAR CONVERSÃO para iniciar.")
+
+        self._build_ui()
+        self.root.after(100, self._process_events)
+
+    def _build_ui(self) -> None:
+        frame = ttk.Frame(self.root, padding=18)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(
+            frame,
+            text="🖼️🎬 Conversor de Fotos e Vídeos",
+            font=("Segoe UI", 18, "bold"),
+        ).pack(anchor="w")
+
+        ttk.Label(
+            frame,
+            text="Converte arquivos restantes para PNG/MP4 | Ignora formatos especificados",
+            font=("Segoe UI", 10),
+        ).pack(anchor="w", pady=(4, 18))
+
+        self._path_row(frame, "📂 Pasta:", self.input_var, self._choose_input)
+
+        ttk.Separator(frame).pack(fill="x", pady=18)
+
+        ttk.Label(
+            frame,
+            textvariable=self.status_var,
+            font=("Segoe UI", 10, "bold"),
+            wraplength=700,
+        ).pack(anchor="w", pady=(0, 8))
+
+        self.progress = ttk.Progressbar(frame, variable=self.progress_var, maximum=100)
+        self.progress.pack(fill="x", ipady=8)
+
+        self.percent_label = ttk.Label(frame, text="0%")
+        self.percent_label.pack(anchor="e")
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=16)
+
+        self.start_button = ttk.Button(buttons, text="▶️ COMEÇAR CONVERSÃO", command=self.start)
+        self.start_button.pack(side="left")
+
+        self.cancel_button = ttk.Button(buttons, text="⏹️ Parar", command=self.stop, state="disabled")
+        self.cancel_button.pack(side="left", padx=8)
+
+        log_frame = ttk.LabelFrame(frame, text="📋 Andamento em Tempo Real")
+        log_frame.pack(fill="both", expand=True, pady=(8, 0))
+
+        self.log = tk.Text(log_frame, height=10, state="disabled", wrap="word")
+        self.log.pack(side="left", fill="both", expand=True)
+
+        scrollbar = ttk.Scrollbar(log_frame, command=self.log.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.log.configure(yscrollcommand=scrollbar.set)
+
+    def _path_row(self, parent: ttk.Frame, label: str, variable: tk.StringVar, command: Callable[[], None]) -> None:
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=5)
+        ttk.Label(row, text=label, width=14).pack(side="left")
+        ttk.Entry(row, textvariable=variable).pack(side="left", fill="x", expand=True)
+        ttk.Button(row, text="Procurar...", command=command).pack(side="left", padx=(8, 0))
+
+    def _choose_input(self) -> None:
+        selected = filedialog.askdirectory(title="Escolha a pasta")
+        if selected:
+            self.input_var.set(selected)
+
+    def start(self) -> None:
+        if self.running:
+            return
+
+        input_dir = Path(self.input_var.get().strip())
+
+        if not input_dir.is_dir():
+            messagebox.showerror("❌ Pasta inválida", "A pasta selecionada não existe.")
+            return
+
+        self.running = True
+        self.stop_event.clear()
+        self.progress_var.set(0)
+
+        self.start_button.configure(state="disabled")
+        self.cancel_button.configure(state="normal")
+
+        self._write_log(f"🚀 Iniciando verificação na pasta: {input_dir}")
+
+        threading.Thread(target=self._worker, args=(input_dir,), daemon=True).start()
+
+    def stop(self) -> None:
+        if self.running:
+            self.stop_event.set()
+            self.status_var.set("⏹️ Parando o processo...")
+
+    def _worker(self, input_dir: Path) -> None:
+        converted, skipped, errors = convert_all(input_dir, self._report, self.stop_event)
+        self.events.put(FinishedEvent(converted, skipped, errors))
+
+    def _report(self, current: int, total: int, message: str) -> None:
+        self.events.put(ProgressEvent(current, total, message))
+
+    def _process_events(self) -> None:
+        try:
+            while True:
+                event = self.events.get_nowait()
+
+                if isinstance(event, ProgressEvent):
+                    percent = 0 if not event.total else event.current * 100 / event.total
+                    self.progress_var.set(percent)
+                    self.percent_label.configure(text=f"{percent:.0f}%")
+                    self.status_var.set(event.message)
+                    self._write_log(event.message)
+
+                else:
+                    self.running = False
+                    self.start_button.configure(state="normal")
+                    self.cancel_button.configure(state="disabled")
+
+                    if event.errors:
+                        messagebox.showwarning(
+                            "⚠️ Concluído com erros",
+                            f"Convertidos: {event.converted}\nIgnorados por formato: {event.skipped}\nErros: {len(event.errors)}"
+                        )
+                    else:
+                        messagebox.showinfo(
+                            "✅ Concluído",
+                            f"Convertidos/substituídos: {event.converted}\nArquivos ignorados: {event.skipped}"
+                        )
+
+        except queue.Empty:
+            pass
+
+        self.root.after(100, self._process_events)
+
+    def _write_log(self, message: str) -> None:
+        self.log.configure(state="normal")
+        self.log.insert("end", message + "\n")
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+
+if __name__ == "__main__":
+    ConverterApp().run()
